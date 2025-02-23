@@ -1,0 +1,250 @@
+= SPEC-001: Decoupling Database from Frontend
+:sectnums:
+:toc:
+
+== Background
+
+The current application is a monolithic web app built using JavaScript with a Node.js backend, tightly coupled to an SQLite database. To transition to a service-oriented cloud-based architecture, the database layer will be decoupled into a standalone application.
+
+The new database application will:
+- Be implemented in Python.
+- Use `sqlmodel` for ORM and validation.
+- Be exposed via `FastAPI` as an interface.
+- Utilize SQL-based ORM functionalities for interactions.
+- Use declarative base mapping in for database models.
+
+As part of this transition, an outward-facing API layer will be designed to facilitate future frontend integrations. While not an immediate priority, the foundational components for this API will be structured to support seamless connectivity when required.  
+
+This transition will enable better maintainability, scalability, and flexibility, allowing different services to interact with the database through a well-defined API.
+
+== Requirements
+
+The system will adhere to the following functional and technical requirements:
+
+=== Must-Have
+- The database must be decoupled from the frontend and implemented as a standalone service.
+- The new database application must be written in Python.
+- The system must use `sqlmodel` for ORM and data validation.
+- The database service must expose a `FastAPI`-based interface for interactions.
+- The service must support CRUD operations for database interactions.
+- The system must follow declarative base mapping for database models.
+- API input validation must be enforced for all requests to the database.
+
+=== Should-Have
+- The API should have structured logging for debugging and monitoring.
+- The database layer should support connection pooling for optimized performance.
+- The service should be containerized (e.g., via Docker) for easier deployment.
+
+=== Could-Have
+- The system could support database migration scripts for versioning.
+- The API could have role-based access control (RBAC) for secure data access.
+- The system could provide OpenAPI documentation for ease of integration.
+
+=== Won’t-Have (for now)
+- A fully developed frontend-facing API will not be implemented immediately, but foundational support for future expansion will be included.
+- Horizontal scaling (e.g., multiple database instances) will not be a priority at this stage.
+- 
+-  
+
+== Method
+
+The system will be structured as a standalone Python service, exposing a `FastAPI`-based API to interact with an SQLite database. The following components define the technical approach:
+
+=== Database Schema
+
+The database models will be implemented using `sqlmodel`, which combines the functionality of SQLAlchemy and Pydantic. The schema will use declarative base mapping.
+
+The workout log will consist of exercises, sets, reps, weight used, and timestamps.
+
+[source,python]
+----
+from sqlmodel import SQLModel, Field
+from datetime import datetime
+from typing import Optional
+
+class WorkoutLog(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    exercise_name: str
+    sets: int
+    reps: int
+    weight: float  # Weight used in the exercise
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+----
+
+=== API Layer
+
+The API will be built using `FastAPI`, exposing endpoints for CRUD operations. Input validation will be enforced via Pydantic models.
+
+[source,python]
+----
+from fastapi import FastAPI
+from sqlmodel import Session, select
+from database import engine, WorkoutLog
+
+app = FastAPI()
+
+@app.post("/workouts/")
+def create_workout(workout: WorkoutLog):
+    with Session(engine) as session:
+        session.add(workout)
+        session.commit()
+        session.refresh(workout)
+        return workout
+
+@app.get("/workouts/")
+def get_workouts():
+    with Session(engine) as session:
+        workouts = session.exec(select(WorkoutLog)).all()
+        return workouts
+----
+
+=== Database Connection Handling
+
+To support multiple SQLite databases, a global dictionary will store database connection strings. A session generator will dynamically manage connections, ensuring each session is properly initialized, committed, and closed.
+
+==== Managing Multiple Database Connections
+
+A dictionary will track database connection strings:
+
+[source,python]
+----
+from sqlmodel import create_engine, Session
+from contextlib import contextmanager
+
+# Dictionary to store multiple database connections
+DATABASES = {
+    "default": "sqlite:///workout_log.db",
+    "backup": "sqlite:///backup_workout_log.db"
+}
+
+# Store database engines
+ENGINES = {name: create_engine(url, echo=True) for name, url in DATABASES.items()}
+
+@contextmanager
+def get_session(db_name: str = "default"):
+    """Session generator that creates and manages database sessions."""
+    if db_name not in ENGINES:
+        raise ValueError(f"Database '{db_name}' not found in configuration.")
+    
+    session = Session(ENGINES[db_name])
+    try:
+        yield session  # Provide session to caller
+        session.commit()  # Commit transaction if successful
+    except Exception as e:
+        session.rollback()  # Rollback on error
+        raise e
+    finally:
+        session.close()  # Ensure session cleanup
+----
+
+==== Initializing Databases
+
+The `create_all` function will ensure tables are created for all registered databases.
+
+[source,python]
+----
+from sqlmodel import SQLModel
+
+def initialize_databases():
+    """Create tables for all configured databases."""
+    for engine in ENGINES.values():
+        SQLModel.metadata.create_all(engine)
+----
+
+This setup ensures:
+- **Multiple databases** can be managed dynamically.
+- **Sessions are properly created, committed, and closed.**
+- **Rollback** occurs on errors, preventing data corruption.
+- **Automatic table creation** for all databases.
+
+
+== Implementation
+
+The implementation involves the following steps:
+
+=== 1. Set Up the Project Structure
+
+Organize the project with the following directory structure:
+
+[source,shell]
+----
+/project-root
+│── /app                 # Contains FastAPI logic
+│   ├── main.py          # API entry point
+│   ├── database.py      # Database session handling
+│   ├── models.py        # SQLModel database schemas
+│── /database            # SQLite databases (auto-created)
+│── initialize_databases.py  # Script to create and initialize databases
+│── requirements.txt
+│── Dockerfile
+│── docker-compose.yml
+----
+
+=== 2. Install Dependencies
+
+Install the required Python packages:
+
+[source,shell]
+----
+pip install fastapi sqlmodel uvicorn
+----
+
+=== 3. Initialize Databases
+
+Run the database initialization script to create SQLite files and set up tables:
+
+[source,shell]
+----
+python initialize_databases.py
+----
+
+=== 4. Implement FastAPI Endpoints
+
+Modify `app/main.py` to expose API endpoints:
+
+[source,python]
+----
+from fastapi import FastAPI, Depends
+from sqlmodel import Session, select
+from app.database import get_session
+from app.models import WorkoutLog
+
+app = FastAPI()
+
+@app.post("/workouts/")
+def create_workout(workout: WorkoutLog, session: Session = Depends(get_session)):
+    session.add(workout)
+    session.commit()
+    session.refresh(workout)
+    return workout
+
+@app.get("/workouts/")
+def get_workouts(session: Session = Depends(get_session)):
+    return session.exec(select(WorkoutLog)).all()
+----
+
+=== 5. Run the Application Locally
+
+Start the FastAPI application:
+
+[source,shell]
+----
+uvicorn app.main:app --reload
+----
+
+=== 6. Containerize the Application (Optional)
+
+Build and run the application using Docker:
+
+[source,shell]
+----
+docker build -t workout-api .
+docker run -p 8000:8000 workout-api
+----
+
+Alternatively, use Docker Compose:
+
+[source,shell]
+----
+docker-compose up
+----
